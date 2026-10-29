@@ -147,7 +147,7 @@ footer a{color:var(--accent)}
   </section>
 
   <section class="card" id="tideCard" hidden>
-    <h2>Marées</h2>
+    <h2>Mer</h2>
     <div id="tideBody"></div>
   </section>
 
@@ -235,6 +235,22 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", () => la
 /* ---------- Utilitaires ---------- */
 const DIRS = ["N","NE","E","SE","S","SO","O","NO"];
 const compass = d => DIRS[Math.round(d / 45) % 8];
+const DIRS_LONG = ["nord","nord-est","est","sud-est","sud","sud-ouest","ouest","nord-ouest"];
+const compassLong = deg => DIRS_LONG[Math.round(deg / 45) % 8];
+const fromDir = deg => { const n = compassLong(deg); return (n === "ouest" || n === "est") ? "de l'" + n : "du " + n; };
+const d1 = x => (Math.round(x * 10) / 10).toLocaleString("fr-FR");
+function douglas(h){
+  const t = [[0.1,"calme, plane"],[0.5,"belle"],[1.25,"peu agitée"],[2.5,"agitée"],[4,"forte"],[6,"très forte"],[9,"grosse"],[14,"très grosse"]];
+  for (const [lim,lab] of t) if (h < lim) return lab;
+  return "énorme";
+}
+function baignLabel(t){ return t < 12 ? "Très froide" : t < 16 ? "Froide" : t < 20 ? "Fraîche" : t < 24 ? "Agréable" : "Chaude"; }
+function sstNow(sst, nowT){
+  const a = sst && sst.hourly && sst.hourly.sea_surface_temperature, tt = sst && sst.hourly && sst.hourly.time;
+  if (!a || !tt) return null;
+  let i = tt.findIndex(t => pseudo(t) >= nowT); if (i < 0) i = 0;
+  return a[i] != null ? a[i] : null;
+}
 const BEAUFORT = [1,6,12,20,29,39,50,62,75,89,103,118];
 const beaufort = k => { let i = 0; while (i < BEAUFORT.length && k >= BEAUFORT[i]) i++; return i; };
 const BF_LABEL = ["Calme","Très légère brise","Légère brise","Petite brise","Jolie brise","Bonne brise","Vent frais","Grand frais","Coup de vent","Fort coup de vent","Tempête","Violente tempête","Ouragan"];
@@ -261,16 +277,21 @@ async function load(place){
   });
   const mp = new URLSearchParams({
     latitude: place.lat, longitude: place.lon, timezone: "auto", forecast_days: 7,
-    hourly: "sea_level_height_msl", cell_selection: "sea"
+    hourly: "sea_level_height_msl,wave_height,wave_period,wave_direction,swell_wave_height,swell_wave_period,swell_wave_direction,wind_wave_height",
+    cell_selection: "sea"
   });
   const marineReq = fetch("https://marine-api.open-meteo.com/v1/marine?" + mp)
+    .then(r => r.ok ? r.json() : null).catch(() => null);
+  // Température de l'eau : requête séparée, car toutes les mers ne la fournissent pas
+  const sp = new URLSearchParams({ latitude: place.lat, longitude: place.lon, timezone: "auto", hourly: "sea_surface_temperature", cell_selection: "sea" });
+  const sstReq = fetch("https://marine-api.open-meteo.com/v1/marine?" + sp)
     .then(r => r.ok ? r.json() : null).catch(() => null);
   try{
     const res = await fetch("https://api.open-meteo.com/v1/forecast?" + p);
     if (!res.ok) throw new Error("HTTP " + res.status);
     const d = await res.json();
     render(place, d);
-    try{ renderTide(place, d, await marineReq); }catch(e){ $("tideCard").hidden = true; }
+    try{ renderTide(place, d, await marineReq, await sstReq); }catch(e){ $("tideCard").hidden = true; }
   }catch(e){
     showMsg("Impossible de récupérer la météo. Vérifiez votre connexion internet, puis relancez la recherche.", true);
   }finally{
@@ -411,80 +432,94 @@ function kmBetween(a1,o1,a2,o2){
   return 12742 * Math.asin(Math.sqrt(x));
 }
 
-function renderTide(place, d, m){
+function renderTide(place, d, m, sst){
   const card = $("tideCard");
-  const vals = m?.hourly?.sea_level_height_msl, times = m?.hourly?.time;
-  const ok = vals && times && vals.filter(v => v != null).length > 48 &&
-             kmBetween(place.lat, place.lon, m.latitude, m.longitude) < 25;
-  if (!ok){ card.hidden = true; return; }
-
-  const nowT = pseudo(d.current.time);
-  const i0 = Math.max(0, times.findIndex(t => pseudo(t) >= nowT - 3600000));
-  const win = vals.slice(i0, i0 + 48).filter(v => v != null);
-  const range = Math.max(...win) - Math.min(...win);
+  const H = (m && m.hourly) || {};
+  const vals = H.sea_level_height_msl, times = H.time;
+  const near = m && m.latitude != null && kmBetween(place.lat, place.lon, m.latitude, m.longitude) < 25;
+  const hasLevel = vals && times && vals.filter(v => v != null).length > 48;
+  const waves = H.wave_height;
+  const hasWave = near && times && waves && waves.some(v => v != null);
+  if (!near || (!hasLevel && !hasWave)){ card.hidden = true; return; }
   card.hidden = false;
 
-  if (range < 0.6){
-    $("tideBody").innerHTML = `<p class="note" style="margin:0">Marnage très faible ici (environ ${Math.round(range*100)} cm). Le coefficient de marée n'a pas de sens sur cette côte.</p>`;
-    return;
+  const nowT = pseudo(d.current.time);
+
+  /* ---------- État de la mer ---------- */
+  let seaHtml = "";
+  if (hasWave){
+    let iw = times.findIndex(t => pseudo(t) >= nowT); if (iw < 0) iw = 0;
+    const at = a => (a && a[iw] != null) ? a[iw] : null;
+    const Hs = at(H.wave_height), Tp = at(H.wave_period), wd = at(H.wave_direction);
+    const sh = at(H.swell_wave_height), stp = at(H.swell_wave_period), sd = at(H.swell_wave_direction);
+    const wt = sstNow(sst, nowT);
+    const tiles = [];
+    if (Hs != null) tiles.push(["Vagues", `${d1(Hs)}<small>m</small>`, `Mer ${douglas(Hs)}${Tp != null ? ` · période ${r(Tp)} s` : ""}`]);
+    if (wd != null) tiles.push(["Direction des vagues", compass(wd), `<span class="arrow" style="transform:rotate(${wd + 180}deg)">↑</span> venant ${fromDir(wd)}`]);
+    if (sh != null) tiles.push(["Houle", `${d1(sh)}<small>m</small>`, `${stp != null ? `période ${r(stp)} s` : ""}${sd != null ? ` · ${compass(sd)}` : ""}` || "—"]);
+    if (wt != null) tiles.push(["Température de l'eau", `${d1(wt)}<small>°C</small>`, baignLabel(wt)]);
+    if (tiles.length)
+      seaHtml = `<span class="chip">État de la mer</span><div class="stats" style="margin-top:10px">${tiles.map(([k,v,sub]) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div><div class="s">${sub}</div></div>`).join("")}</div>`;
   }
 
-  /* Coefficients */
-  const co = coefficients(d.daily.time[0], 7, d.utc_offset_seconds || 0);
-  const today = co[d.daily.time[0]] || [];
-  const cMax = today.length ? Math.max(...today) : null;
-
-  /* Prochaines pleines et basses mers */
-  const ex = extrema(times, vals);
-  const next = ex.filter(e => e.t >= nowT).slice(0, 4);
-
-  /* Courbe sur 36 h */
-  const span = 36, W = 600, H = 150, padT = 26, padB = 26;
-  const pts = [];
-  for (let k = 0; k <= span; k++){ const v = vals[i0 + k]; if (v != null) pts.push([k, v]); }
-  const vmin = Math.min(...pts.map(p => p[1])), vmax = Math.max(...pts.map(p => p[1])), vs = Math.max(vmax - vmin, .1);
-  const t0 = pseudo(times[i0]);
-  const X = t => (t - t0) / 3600000 / span * W, Yv = v => padT + (1 - (v - vmin) / vs) * (H - padT - padB);
-  const poly = pts.map(([k,v]) => `${(k/span*W).toFixed(1)},${Yv(v).toFixed(1)}`).join(" ");
-  const ticks = [];
-  for (let k = 0; k <= span; k++){
-    const t = t0 + k * 3600000, hr = new Date(t).getUTCHours();
-    if (hr % 6 === 0) ticks.push(`<line x1="${X(t)}" x2="${X(t)}" y1="${padT-8}" y2="${H-padB}" stroke="var(--line)" stroke-dasharray="${hr===0?"":"2 3"}"/><text x="${X(t)}" y="${H-8}" text-anchor="middle" font-size="11" font-family="IBM Plex Mono, monospace" fill="var(--muted)">${hr===0 ? dayWord(t,nowT) : hr+" h"}</text>`);
+  /* ---------- Marées ---------- */
+  let tideHtml = "";
+  if (hasLevel){
+    const i0 = Math.max(0, times.findIndex(t => pseudo(t) >= nowT - 3600000));
+    const win = vals.slice(i0, i0 + 48).filter(v => v != null);
+    const range = Math.max(...win) - Math.min(...win);
+    if (range < 0.6){
+      tideHtml = `<p class="note" style="margin-top:14px">Pas de marée notable ici : sur cette mer (la Méditerranée, par exemple), le niveau ne varie que de quelques centimètres.</p>`;
+    } else {
+      const co = coefficients(d.daily.time[0], 7, d.utc_offset_seconds || 0);
+      const today = co[d.daily.time[0]] || [];
+      const cMax = today.length ? Math.max(...today) : null;
+      const ex = extrema(times, vals);
+      const next = ex.filter(e => e.t >= nowT).slice(0, 4);
+      const span = 36, W = 600, Hc = 150, padT = 26, padB = 26;
+      const pts = [];
+      for (let k = 0; k <= span; k++){ const v = vals[i0 + k]; if (v != null) pts.push([k, v]); }
+      const vmin = Math.min(...pts.map(p => p[1])), vmax = Math.max(...pts.map(p => p[1])), vs = Math.max(vmax - vmin, .1);
+      const t0 = pseudo(times[i0]);
+      const X = t => (t - t0) / 3600000 / span * W, Yv = v => padT + (1 - (v - vmin) / vs) * (Hc - padT - padB);
+      const poly = pts.map(([k,v]) => `${(k/span*W).toFixed(1)},${Yv(v).toFixed(1)}`).join(" ");
+      const ticks = [];
+      for (let k = 0; k <= span; k++){
+        const t = t0 + k * 3600000, hr = new Date(t).getUTCHours();
+        if (hr % 6 === 0) ticks.push(`<line x1="${X(t)}" x2="${X(t)}" y1="${padT-8}" y2="${Hc-padB}" stroke="var(--line)" stroke-dasharray="${hr===0?"":"2 3"}"/><text x="${X(t)}" y="${Hc-8}" text-anchor="middle" font-size="11" font-family="IBM Plex Mono, monospace" fill="var(--muted)">${hr===0 ? dayWord(t,nowT) : hr+" h"}</text>`);
+      }
+      const marks = ex.filter(e => e.t >= t0 && e.t <= t0 + span*3600000).map(e => {
+        const x = X(e.t), y = Yv(e.h), up = e.type === "PM";
+        const anchor = x < 30 ? "start" : x > W - 30 ? "end" : "middle";
+        return `<circle cx="${x}" cy="${y}" r="3.5" fill="${up ? "var(--accent)" : "var(--muted)"}"/><text x="${x}" y="${up ? y-8 : y+16}" text-anchor="${anchor}" font-size="11" font-weight="500" font-family="IBM Plex Mono, monospace" fill="var(--fg)">${hhmm(e.t)}</text>`;
+      }).join("");
+      const nowX = X(nowT);
+      const curve = `<svg viewBox="0 0 ${W} ${Hc}" aria-label="Hauteur d'eau sur 36 heures">
+        <defs><linearGradient id="gt" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--accent)" stop-opacity=".25"/><stop offset="1" stop-color="var(--accent)" stop-opacity="0"/></linearGradient></defs>
+        ${ticks.join("")}
+        <polygon points="0,${Hc-padB} ${poly} ${pts[pts.length-1][0]/span*W},${Hc-padB}" fill="url(#gt)"/>
+        <polyline points="${poly}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round"/>
+        <line x1="${nowX}" x2="${nowX}" y1="${padT-8}" y2="${Hc-padB}" stroke="var(--warm)" stroke-width="1.5"/>
+        ${marks}
+      </svg>`;
+      const week = d.daily.time.map((t,i) => {
+        const c = co[t] ? Math.max(...co[t]) : null;
+        return `<div class="wc" title="${c ? coefLabel(c) : ""}"><b>${c ?? "–"}</b><i style="height:${c ? Math.round(c/120*56) : 2}px"></i><span>${fmtDay(t,i)}</span></div>`;
+      }).join("");
+      tideHtml = `<div style="margin-top:16px"><span class="chip">Marées</span></div>
+        <div class="tide-top" style="margin-top:10px">
+          <div class="coef">${cMax ?? "–"}</div>
+          <div class="coef-lbl"><span class="chip">${cMax ? coefLabel(cMax) : ""}</span><strong>Coefficient du jour</strong>
+            <span>${today.length > 1 ? "Matin " + today[0] + " · soir " + today[1] : today.length ? "Une seule pleine mer aujourd'hui" : ""}</span></div>
+        </div>
+        <div class="tides">${next.map(e => `<div class="tl ${e.type === "PM" ? "pm" : ""}"><span class="k">${e.type === "PM" ? "Pleine mer" : "Basse mer"}</span><span class="v">${hhmm(e.t)}</span><span class="k">${dayWord(e.t, nowT)}</span></div>`).join("")}</div>
+        <div class="tide-curve">${curve}</div>
+        <div class="week-coef">${week}</div>`;
+    }
   }
-  const marks = ex.filter(e => e.t >= t0 && e.t <= t0 + span*3600000).map(e => {
-    const x = X(e.t), y = Yv(e.h), up = e.type === "PM";
-    const anchor = x < 30 ? "start" : x > W - 30 ? "end" : "middle";
-    return `<circle cx="${x}" cy="${y}" r="3.5" fill="${up ? "var(--accent)" : "var(--muted)"}"/><text x="${x}" y="${up ? y-8 : y+16}" text-anchor="${anchor}" font-size="11" font-weight="500" font-family="IBM Plex Mono, monospace" fill="var(--fg)">${hhmm(e.t)}</text>`;
-  }).join("");
-  const nowX = X(nowT);
-  const curve = `<svg viewBox="0 0 ${W} ${H}" aria-label="Hauteur d'eau sur 36 heures">
-    <defs><linearGradient id="gt" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="var(--accent)" stop-opacity=".25"/><stop offset="1" stop-color="var(--accent)" stop-opacity="0"/></linearGradient></defs>
-    ${ticks.join("")}
-    <polygon points="0,${H-padB} ${poly} ${pts[pts.length-1][0]/span*W},${H-padB}" fill="url(#gt)"/>
-    <polyline points="${poly}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round"/>
-    <line x1="${nowX}" x2="${nowX}" y1="${padT-8}" y2="${H-padB}" stroke="var(--warm)" stroke-width="1.5"/>
-    ${marks}
-  </svg>`;
 
-  /* Coefficients de la semaine */
-  const week = d.daily.time.map((t,i) => {
-    const c = co[t] ? Math.max(...co[t]) : null;
-    return `<div class="wc" title="${c ? coefLabel(c) : ""}"><b>${c ?? "–"}</b><i style="height:${c ? Math.round(c/120*56) : 2}px"></i><span>${fmtDay(t,i)}</span></div>`;
-  }).join("");
-
-  $("tideBody").innerHTML = `
-    <div class="tide-top">
-      <div class="coef">${cMax ?? "–"}</div>
-      <div class="coef-lbl">
-        <span class="chip">${cMax ? coefLabel(cMax) : ""}</span>
-        <strong>Coefficient du jour</strong>
-        <span>${today.length > 1 ? "Matin " + today[0] + " · soir " + today[1] : today.length ? "Une seule pleine mer aujourd'hui" : ""}</span>
-      </div>
-    </div>
-    <div class="tides">${next.map(e => `<div class="tl ${e.type === "PM" ? "pm" : ""}"><span class="k">${e.type === "PM" ? "Pleine mer" : "Basse mer"}</span><span class="v">${hhmm(e.t)}</span><span class="k">${dayWord(e.t, nowT)}</span></div>`).join("")}</div>
-    <div class="tide-curve">${curve}</div>
-    <div class="week-coef">${week}</div>
-    <p class="note">Coefficient calculé pour la référence de Brest, à 2 points près. Les heures de pleine et basse mer sont estimées par Open-Meteo à quelques dizaines de minutes près : ne les utilisez pas pour la navigation ou la pêche à pied, consultez un annuaire officiel (SHOM).</p>`;
+  $("tideBody").innerHTML = seaHtml + tideHtml +
+    `<p class="note">Vagues, houle et température de l'eau : prévisions Open-Meteo (modèle), à titre indicatif. Coefficient de marée calculé sur la référence de Brest (à 2 points près) ; heures de marée approchées. Pour la navigation ou la pêche à pied, fiez-vous à un bulletin et à un annuaire officiels (Météo-France, SHOM).</p>`;
 }
 
 /* ---------- Recherche ---------- */
